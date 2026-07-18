@@ -1,41 +1,28 @@
 import os
 import time
 import uuid
-import chromadb
 from google import genai
 from google.genai import types
 from pypdf import PdfReader
 from dotenv import load_dotenv
+from supabase import create_client
 
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 _client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 EMBEDDING_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 GENERATION_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-flash-latest")
+EMBED_DIMENSIONS = 768  # Supabase table isi dimension pe bani hai
 
-CHROMA_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_db")
-COLLECTION_NAME = "sarkari_yojana"
-
-# ChromaDB persistent client - data disk pe save rehta hai, restart pe bhi nahi udta
-_chroma_client = chromadb.PersistentClient(
-    path=CHROMA_DB_PATH,
-    settings=chromadb.Settings(anonymized_telemetry=False),
-)
-
-_collection = _chroma_client.get_or_create_collection(
-    name=COLLECTION_NAME,
-    embedding_function=None,
-)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+_supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+TABLE_NAME = "scheme_chunks"
 
 
-# ---------------------------------------------------------------------------
-# STEP 1: PDF se text nikalna
-# ---------------------------------------------------------------------------
 def extract_text_from_pdf(file_path: str) -> str:
-    """PDF file ka poora text ek single string mein return karta hai."""
     reader = PdfReader(file_path)
     full_text = []
     for page in reader.pages:
@@ -44,21 +31,10 @@ def extract_text_from_pdf(file_path: str) -> str:
     return "\n".join(full_text)
 
 
-# ---------------------------------------------------------------------------
-# STEP 2: Text ko chunks mein todna
-# ---------------------------------------------------------------------------
 def chunk_text(text: str, chunk_size: int = 400, overlap: int = 60) -> list:
-    """
-    Text ko word-based chunks mein todta hai, thoda overlap rakhte hue.
-
-    Overlap kyun? Agar ek important sentence exactly do chunks ke beech
-    mein cut ho jaye, to context incomplete ho jayega. Overlap us risk ko
-    kam karta hai.
-    """
     words = text.split()
     if not words:
         return []
-
     chunks = []
     start = 0
     while start < len(words):
@@ -67,34 +43,23 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 60) -> list:
         if chunk.strip():
             chunks.append(chunk)
         start += chunk_size - overlap
-
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# STEP 3: Embeddings banana (naye google-genai SDK se)
-# ---------------------------------------------------------------------------
 def get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT", max_retries: int = 6) -> list:
-    """
-    Gemini embedding model se text ka vector nikalta hai.
-    task_type: 'RETRIEVAL_DOCUMENT' jab document store kar rahe ho,
-               'RETRIEVAL_QUERY' jab user ka sawal embed kar rahe ho.
-
-    Free tier mein per-minute request limit kaafi kam hoti hai, isliye
-    agar 429 (rate limit) ya 503 (Google server temporary down) error
-    aaye to yeh function khud thoda ruk kar (exponential backoff)
-    dobara try karta hai, bajaye turant fail hone ke.
-    """
     if _client is None:
         raise RuntimeError("GEMINI_API_KEY set nahi hai. .env file check karo.")
 
-    delay = 5  # seconds - pehli retry se pehle itna rukenge
+    delay = 5
     for attempt in range(max_retries):
         try:
             result = _client.models.embed_content(
                 model=EMBEDDING_MODEL,
                 contents=text,
-                config=types.EmbedContentConfig(task_type=task_type),
+                config=types.EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=EMBED_DIMENSIONS,
+                ),
             )
             return result.embeddings[0].values
         except Exception as exc:
@@ -107,84 +72,61 @@ def get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT", max_retries:
             if is_rate_limit and attempt < max_retries - 1:
                 print(f"    [RATE LIMIT/SERVER] {delay} second ruk kar dobara try kar rahe hain...")
                 time.sleep(delay)
-                delay = min(delay * 2, 60)  # har baar zyada rukna, max 60 sec
+                delay = min(delay * 2, 60)
             else:
                 raise
 
 
-# ---------------------------------------------------------------------------
-# STEP 4: Document ko process karke ChromaDB mein add karna
-# ---------------------------------------------------------------------------
 def add_document(file_path: str, filename: str) -> int:
-    """
-    PDF file ko poora process karta hai: extract -> chunk -> embed -> store.
-    Return karta hai kitne chunks add hue.
-    """
+    if _supabase is None:
+        raise RuntimeError("SUPABASE_URL / SUPABASE_KEY set nahi hai. .env file check karo.")
+
     text = extract_text_from_pdf(file_path)
     chunks = chunk_text(text)
 
     if not chunks:
         return 0
 
-    ids = []
-    embeddings = []
-    documents = []
-    metadatas = []
-
+    rows = []
     for i, chunk in enumerate(chunks):
-        chunk_id = f"{filename}_{uuid.uuid4().hex[:8]}_{i}"
         embedding = get_embedding(chunk, task_type="RETRIEVAL_DOCUMENT")
-
-        ids.append(chunk_id)
-        embeddings.append(embedding)
-        documents.append(chunk)
-        metadatas.append({"source": filename, "chunk_index": i})
-
-        # Free tier ki per-minute limit se bachne ke liye har chunk ke
-        # baad thoda ruk jaate hain (proactive throttling)
+        rows.append({
+            "id": f"{filename}_{uuid.uuid4().hex[:8]}_{i}",
+            "content": chunk,
+            "embedding": embedding,
+            "source": filename,
+            "chunk_index": i,
+        })
         time.sleep(2)
-
         if (i + 1) % 10 == 0:
             print(f"    ... {i + 1}/{len(chunks)} chunks embed ho chuke hain")
 
-    _collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        documents=documents,
-        metadatas=metadatas,
-    )
+    for i in range(0, len(rows), 100):
+        _supabase.table(TABLE_NAME).insert(rows[i:i + 100]).execute()
 
     return len(chunks)
 
 
-# ---------------------------------------------------------------------------
-# STEP 5: Retrieval - user ke sawal se relevant chunks dhoondhna
-# ---------------------------------------------------------------------------
 def retrieve_relevant_chunks(question: str, n_results: int = 5) -> list:
-    """User ke sawal ke embedding se ChromaDB mein similarity search karta hai."""
-    if _collection.count() == 0:
+    if _supabase is None:
         return []
 
     query_embedding = get_embedding(question, task_type="RETRIEVAL_QUERY")
 
-    results = _collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(n_results, _collection.count()),
-    )
+    response = _supabase.rpc(
+        "match_scheme_chunks",
+        {"query_embedding": query_embedding, "match_count": n_results},
+    ).execute()
 
     chunks = []
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
-
-    for doc, meta in zip(documents, metadatas):
-        chunks.append({"text": doc, "metadata": meta})
-
+    for row in response.data:
+        chunks.append({
+            "text": row["content"],
+            "metadata": {"source": row["source"]},
+        })
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# STEP 6: Grounded answer generate karna
-# ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION = """Tum "Sarkari Yojana Finder" naam ke AI assistant ho jo Indian
 government schemes (jaise PM Kisan, Ayushman Bharat, PMAY, etc.) ke baare mein
 logon ki madad karta hai.
@@ -208,11 +150,6 @@ STRICT RULES (kabhi mat todna):
 
 
 def generate_answer(question: str, retrieved_chunks: list) -> dict:
-    """
-    Retrieved chunks ko context bana kar Gemini se grounded answer generate
-    karta hai. Agar koi chunk retrieve hi nahi hua (documents upload nahi
-    hue), to seedha bata deta hai.
-    """
     if not retrieved_chunks:
         return {
             "answer": (
@@ -224,10 +161,7 @@ def generate_answer(question: str, retrieved_chunks: list) -> dict:
         }
 
     if _client is None:
-        return {
-            "answer": "GEMINI_API_KEY set nahi hai. .env file check karo.",
-            "sources": [],
-        }
+        return {"answer": "GEMINI_API_KEY set nahi hai. .env file check karo.", "sources": []}
 
     context = "\n\n---\n\n".join(c["text"] for c in retrieved_chunks)
     sources = sorted({c["metadata"]["source"] for c in retrieved_chunks})
@@ -238,23 +172,33 @@ def generate_answer(question: str, retrieved_chunks: list) -> dict:
         f"ANSWER:"
     )
 
-    response = _client.models.generate_content(
-        model=GENERATION_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
-    )
-
-    return {"answer": response.text, "sources": sources}
+    delay = 5
+    for attempt in range(5):
+        try:
+            response = _client.models.generate_content(
+                model=GENERATION_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
+            )
+            return {"answer": response.text, "sources": sources}
+        except Exception as exc:
+            is_temp = "429" in str(exc) or "503" in str(exc) or "UNAVAILABLE" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
+            if is_temp and attempt < 4:
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+            else:
+                return {"answer": "Gemini server abhi busy hai. Thodi der mein dobara try karo.", "sources": sources}
 
 
 def list_uploaded_documents() -> list:
-    """ChromaDB mein stored saare unique document (filename) return karta hai."""
-    if _collection.count() == 0:
+    if _supabase is None:
         return []
-    all_metadata = _collection.get(include=["metadatas"])["metadatas"]
-    return sorted({m["source"] for m in all_metadata})
+    response = _supabase.table(TABLE_NAME).select("source").execute()
+    return sorted({row["source"] for row in response.data})
 
 
 def get_document_count() -> int:
-    """Kitne chunks total store hain (debug/status ke liye)."""
-    return _collection.count()
+    if _supabase is None:
+        return 0
+    response = _supabase.table(TABLE_NAME).select("id", count="exact").execute()
+    return response.count or 0
