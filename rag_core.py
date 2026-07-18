@@ -24,7 +24,11 @@ _chroma_client = chromadb.PersistentClient(
     path=CHROMA_DB_PATH,
     settings=chromadb.Settings(anonymized_telemetry=False),
 )
-_collection = _chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+
+_collection = _chroma_client.get_or_create_collection(
+    name=COLLECTION_NAME,
+    embedding_function=None,
+)
 
 
 # ---------------------------------------------------------------------------
