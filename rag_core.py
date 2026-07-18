@@ -26,23 +26,6 @@ _chroma_client = chromadb.PersistentClient(
 )
 _collection = _chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
-# ----- RENDER FALLBACK: Load from pickle if DB is empty -----
-if _collection.count() == 0:
-    try:
-        import pickle
-        with open("chroma_backup.pkl", "rb") as f:
-            backup = pickle.load(f)
-        _collection.add(
-            ids=backup["ids"],
-            embeddings=backup["embeddings"],
-            documents=backup["documents"],
-            metadatas=backup["metadatas"]
-        )
-        print(f"✅ Pickle se {len(backup['ids'])} chunks load ho gaye!")
-    except Exception as e:
-        print(f"⚠️ Pickle load error: {e}")
-# ------------------------------------------------------
-
 
 # ---------------------------------------------------------------------------
 # STEP 1: PDF se text nikalna
