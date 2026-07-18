@@ -1,7 +1,10 @@
 # 🏛️ Sarkari Yojana Finder — AI-Powered Government Scheme Discovery
 
 > A RAG-powered chatbot helping Indian citizens discover relevant government welfare schemes through natural language search.
-
+>
+> **🔗 Live Demo:**  https://sarkari-yojana-finder.onrender.com
+**📂 GitHub:**  https://github.com/Rev-ImranKhan/Sarkari-Yojana-Finder
+> 
 ## 🎯 Overview
 
 India has hundreds of government welfare schemes across central and state levels, but 
